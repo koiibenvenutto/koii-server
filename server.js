@@ -548,7 +548,7 @@ app.post('/webhook/channel-sync', async (req, res) => {
       }
     }
 
-    const summary = { channelName, storiesFound: storyIds.size, created, skipped };
+    const summary = { channelName, storiesChecked: matchingStoryIds.length, created, skipped };
     console.log('✅ Channel sync completed:', summary);
     res.status(200).json({ message: 'Channel synced to stories', ...summary });
 
@@ -561,12 +561,13 @@ app.post('/webhook/channel-sync', async (req, res) => {
 });
 
 // ─── Send Sync: Promo Sends DB → Channels DB ───────────────────────────────
-// When a new send is added directly in Promo Sends DB, push it back to Channels DB
+// When a send is added/edited in Promo Sends DB, push new channels back to Channels DB.
+// Only processes sends that have both a name AND a Story relation set,
+// so it won't fire prematurely while the user is still typing.
 
 app.post('/webhook/send-sync', async (req, res) => {
   try {
     console.log('🔄 Received send-sync webhook');
-    console.log('Request body:', JSON.stringify(req.body, null, 2));
 
     const sendId = req.body.sendId ||
                    req.body.data?.id ||
@@ -587,12 +588,17 @@ app.post('/webhook/send-sync', async (req, res) => {
       });
     }
 
-    // Get the send's details
+    // Re-fetch the page to get current state (not stale webhook data)
     const sendPage = await notion.pages.retrieve({ page_id: sendId });
     const sendName = sendPage.properties?.Name?.title?.[0]?.plain_text || '';
+    const storyRel = sendPage.properties?.Story?.relation;
 
+    // Gate: only sync if the send has both a name and a linked story
     if (!sendName) {
-      return res.status(200).json({ message: 'Send has no name, skipping' });
+      return res.status(200).json({ message: 'Send has no name yet, skipping' });
+    }
+    if (!storyRel || storyRel.length === 0) {
+      return res.status(200).json({ message: 'Send has no Story linked yet, skipping' });
     }
 
     // Check if this channel already exists in Channels DB
@@ -611,13 +617,8 @@ app.post('/webhook/send-sync', async (req, res) => {
       });
     }
 
-    // Get the send's story to inherit its projects for the new channel
-    const storyRel = sendPage.properties?.Story?.relation;
-    const projectIds = [];
-    if (storyRel?.[0]?.id) {
-      const storyProjects = await getStoryProjects(storyRel[0].id);
-      for (const id of storyProjects) projectIds.push(id);
-    }
+    // Inherit projects from the linked story
+    const projectIds = await getStoryProjects(storyRel[0].id);
 
     // Create the channel in Channels DB
     const channelProperties = {
@@ -626,7 +627,6 @@ app.post('/webhook/send-sync', async (req, res) => {
       }
     };
 
-    // Add projects if we found them from the story
     if (projectIds.length > 0) {
       channelProperties['🚀 projects'] = {
         relation: projectIds.map(id => ({ id }))
