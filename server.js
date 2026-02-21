@@ -27,7 +27,6 @@ const STORIES_DB_ID = process.env.STORIES_DB_ID;
 // Database IDs — Promo Sends
 const PROMO_STORIES_DB_ID = process.env.PROMO_STORIES_DB_ID;
 const PROMO_CHANNELS_DB_ID = process.env.PROMO_CHANNELS_DB_ID;
-const PROMO_SENDS_DB_ID = process.env.PROMO_SENDS_DB_ID;
 
 // Store recent debug messages
 let debugMessages = [];
@@ -273,9 +272,9 @@ app.post('/webhook/promo-sends', async (req, res) => {
       });
     }
 
-    if (!PROMO_CHANNELS_DB_ID || !PROMO_SENDS_DB_ID) {
+    if (!PROMO_CHANNELS_DB_ID || !PROMO_STORIES_DB_ID) {
       return res.status(500).json({
-        error: 'Server misconfigured: PROMO_CHANNELS_DB_ID and PROMO_SENDS_DB_ID must be set'
+        error: 'Server misconfigured: PROMO_CHANNELS_DB_ID and PROMO_STORIES_DB_ID must be set'
       });
     }
 
@@ -287,30 +286,29 @@ app.post('/webhook/promo-sends', async (req, res) => {
     const channels = await getChannelsForProjects(projectIds);
     console.log(`📡 Found ${channels.length} matching channel(s)`);
 
-    // Step 3: Check which sends already exist (skip duplicates)
-    const existingChannelIds = await getExistingPromoSends(storyId);
-    console.log(`📋 ${existingChannelIds.size} existing send(s) to skip`);
+    // Step 3: Check existing sub-tasks to avoid duplicates
+    const existingChannelNames = await getExistingSubTaskChannels(storyId);
+    console.log(`📋 ${existingChannelNames.size} existing sub-task(s) to skip`);
 
-    const newChannels = channels.filter(ch => !existingChannelIds.has(ch.id));
-    console.log(`🆕 ${newChannels.length} new send(s) to create`);
+    const newChannels = channels.filter(ch => {
+      const name = getChannelName(ch);
+      return !existingChannelNames.has(name);
+    });
+    console.log(`🆕 ${newChannels.length} new sub-task(s) to create`);
 
-    // Step 4: Bulk-create promo send pages
-    const createResults = await createPromoSends(storyId, newChannels);
-
-    // Step 5: Embed linked view in story page
-    const viewAdded = await embedPromoSendsView(storyId);
+    // Step 4: Create sub-tasks in Stories DB
+    const createResults = await createPromoSubTasks(storyId, newChannels);
 
     const summary = {
       storyId,
       channelsFound: channels.length,
-      sendsCreated: createResults.created,
-      sendsSkipped: existingChannelIds.size,
-      sendsFailed: createResults.failed,
-      linkedViewAdded: viewAdded
+      subTasksCreated: createResults.created,
+      subTasksSkipped: existingChannelNames.size,
+      subTasksFailed: createResults.failed
     };
 
     console.log('✅ Promo sends completed:', summary);
-    res.status(200).json({ message: 'Promo sends processed', ...summary });
+    res.status(200).json({ message: 'Promo send sub-tasks created', ...summary });
 
   } catch (error) {
     console.error('❌ Promo sends error:', error);
@@ -378,112 +376,65 @@ async function getChannelsForProjects(projectIds) {
   return channels;
 }
 
-// Query Promo Sends DB for existing sends linked to this story, return set of channel IDs
-async function getExistingPromoSends(storyId) {
-  const existingChannelIds = new Set();
+// Get channel name from a channel page object
+function getChannelName(channel) {
+  return channel.properties?.Name?.title?.[0]?.plain_text || 'Unnamed Channel';
+}
 
-  const response = await notion.databases.query({
-    database_id: PROMO_SENDS_DB_ID,
-    filter: {
-      property: 'Event',
-      relation: { contains: storyId }
-    }
-  });
+// Check existing sub-tasks of a story, return set of names that look like promo sends
+async function getExistingSubTaskChannels(storyId) {
+  const page = await notion.pages.retrieve({ page_id: storyId });
+  const subTaskProp = page.properties['Sub-task'];
+  const existingNames = new Set();
 
-  for (const page of response.results) {
-    const channelProp = page.properties.Channel;
-    if (channelProp?.relation) {
-      for (const rel of channelProp.relation) {
-        existingChannelIds.add(rel.id);
+  if (!subTaskProp?.relation || subTaskProp.relation.length === 0) {
+    return existingNames;
+  }
+
+  // Fetch each sub-task to check its name
+  for (const rel of subTaskProp.relation) {
+    try {
+      const subTask = await notion.pages.retrieve({ page_id: rel.id });
+      const name = subTask.properties?.Name?.title?.[0]?.plain_text || '';
+      if (name.startsWith('Send: ')) {
+        existingNames.add(name.replace('Send: ', ''));
       }
+    } catch (error) {
+      console.error(`⚠️ Could not fetch sub-task ${rel.id}:`, error.message);
     }
   }
 
-  return existingChannelIds;
+  return existingNames;
 }
 
-// Create a Promo Send page for each channel, return { created, failed }
-async function createPromoSends(storyId, channels) {
+// Create sub-tasks in Stories DB for each channel, return { created, failed }
+async function createPromoSubTasks(storyId, channels) {
   let created = 0;
   let failed = 0;
 
   for (const channel of channels) {
     try {
+      const channelName = getChannelName(channel);
       await notion.pages.create({
-        parent: { database_id: PROMO_SENDS_DB_ID },
+        parent: { database_id: PROMO_STORIES_DB_ID },
         properties: {
-          Event: { relation: [{ id: storyId }] },
-          Channel: { relation: [{ id: channel.id }] },
-          Sent: { checkbox: false }
+          Name: {
+            title: [{ text: { content: `Send: ${channelName}` } }]
+          },
+          'Parent task': {
+            relation: [{ id: storyId }]
+          }
         }
       });
+      console.log(`✅ Created sub-task: Send: ${channelName}`);
       created++;
     } catch (error) {
-      console.error(`❌ Failed to create send for channel ${channel.id}:`, error.message);
+      console.error(`❌ Failed to create sub-task for channel ${channel.id}:`, error.message);
       failed++;
     }
   }
 
   return { created, failed };
-}
-
-// Append a link to the Promo Sends DB in the story page.
-// Skips if a "Promo Sends" heading already exists (to avoid duplicates on re-trigger).
-async function embedPromoSendsView(storyId) {
-  try {
-    // Check existing blocks for a "Promo Sends" heading (duplicate guard)
-    const existingBlocks = await notion.blocks.children.list({
-      block_id: storyId,
-      page_size: 100
-    });
-
-    const alreadyHasView = existingBlocks.results.some(block => {
-      if (block.type === 'heading_2') {
-        const text = block.heading_2?.rich_text?.[0]?.plain_text || '';
-        return text.toLowerCase().includes('promo sends');
-      }
-      return false;
-    });
-
-    if (alreadyHasView) {
-      console.log('📎 Promo Sends section already exists, skipping');
-      return false;
-    }
-
-    // Append a heading + link to the Promo Sends DB
-    const promoSendsUrl = `https://www.notion.so/${PROMO_SENDS_DB_ID.replace(/-/g, '')}`;
-    await notion.blocks.children.append({
-      block_id: storyId,
-      children: [
-        {
-          object: 'block',
-          type: 'heading_2',
-          heading_2: {
-            rich_text: [{ type: 'text', text: { content: 'Promo Sends' } }]
-          }
-        },
-        {
-          object: 'block',
-          type: 'paragraph',
-          paragraph: {
-            rich_text: [{
-              type: 'text',
-              text: {
-                content: 'View Promo Sends',
-                link: { url: promoSendsUrl }
-              }
-            }]
-          }
-        }
-      ]
-    });
-
-    console.log('📎 Promo Sends link added to story page');
-    return true;
-  } catch (error) {
-    console.error('⚠️ Failed to embed promo sends view (non-fatal):', error.message);
-    return false;
-  }
 }
 
 // Test epic retrieval endpoint
