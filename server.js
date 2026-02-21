@@ -252,13 +252,15 @@ app.get('/debug', (req, res) => {
 });
 
 // ─── Promo Sends Endpoint ───────────────────────────────────────────────────
+// Button-triggered bidirectional sync:
+// 1. Reverse sync: push any new channels from Promo Sends DB → Channels DB
+// 2. Forward sync: pull channels from Channels DB → create sends for this story
 
 app.post('/webhook/promo-sends', async (req, res) => {
   try {
     console.log('🚀 Received promo-sends webhook');
     console.log('Request body:', JSON.stringify(req.body, null, 2));
 
-    // Extract storyId — same flexible pattern as existing endpoint
     const storyId = req.body.storyId ||
                     req.body.data?.id ||
                     req.body.page?.id ||
@@ -279,15 +281,17 @@ app.post('/webhook/promo-sends', async (req, res) => {
       });
     }
 
-    // Step 1: Get the story's project IDs
+    // ── Step 1: Reverse sync — push new channels from Promo Sends → Channels DB ──
+    const reverseResults = await syncSendsToChannels(storyId);
+    console.log(`🔄 Reverse sync: ${reverseResults.created} new channel(s) pushed to Channels DB`);
+
+    // ── Step 2: Forward sync — pull channels from Channels DB → Promo Sends ──
     const projectIds = await getStoryProjects(storyId);
     console.log(`📁 Story has ${projectIds.length} project(s)`);
 
-    // Step 2: Find channels matching those projects
     const channels = await getChannelsForProjects(projectIds);
     console.log(`📡 Found ${channels.length} matching channel(s)`);
 
-    // Step 3: Check existing sends to avoid duplicates
     const existingSendNames = await getExistingSends(storyId);
     console.log(`📋 ${existingSendNames.size} existing send(s) to skip`);
 
@@ -297,19 +301,19 @@ app.post('/webhook/promo-sends', async (req, res) => {
     });
     console.log(`🆕 ${newChannels.length} new send(s) to create`);
 
-    // Step 4: Create sends in Promo Sends DB
-    const createResults = await createPromoSends(storyId, newChannels);
+    const forwardResults = await createPromoSends(storyId, newChannels);
 
     const summary = {
       storyId,
+      channelsPushedToChannelsDB: reverseResults.created,
       channelsFound: channels.length,
-      sendsCreated: createResults.created,
+      sendsCreated: forwardResults.created,
       sendsSkipped: existingSendNames.size,
-      sendsFailed: createResults.failed
+      sendsFailed: forwardResults.failed
     };
 
-    console.log('✅ Promo sends completed:', summary);
-    res.status(200).json({ message: 'Promo sends created', ...summary });
+    console.log('✅ Promo sync completed:', summary);
+    res.status(200).json({ message: 'Promo sync completed', ...summary });
 
   } catch (error) {
     console.error('❌ Promo sends error:', error);
@@ -438,219 +442,65 @@ async function createPromoSends(storyId, channels, projectIds = []) {
   return { created, failed };
 }
 
-// ─── Channel Sync: Channels DB → Promo Sends DB ────────────────────────────
-// When a new channel is added to Channels DB, propagate it to all active stories
+// Reverse sync: find sends in Promo Sends DB for this story that don't exist
+// in Channels DB and push them there
+async function syncSendsToChannels(storyId) {
+  let created = 0;
 
-app.post('/webhook/channel-sync', async (req, res) => {
-  try {
-    console.log('🔄 Received channel-sync webhook');
-    console.log('Request body:', JSON.stringify(req.body, null, 2));
+  // Get all send names for this story
+  const existingSendNames = await getExistingSends(storyId);
 
-    const channelId = req.body.channelId ||
-                      req.body.data?.id ||
-                      req.body.page?.id ||
-                      req.body.pageId ||
-                      req.body.id;
-
-    if (!channelId || typeof channelId !== 'string') {
-      return res.status(400).json({
-        error: 'Missing or invalid channelId',
-        receivedPayload: req.body
-      });
-    }
-
-    if (!PROMO_SENDS_DB_ID || !PROMO_CHANNELS_DB_ID) {
-      return res.status(500).json({
-        error: 'Server misconfigured: PROMO_SENDS_DB_ID and PROMO_CHANNELS_DB_ID must be set'
-      });
-    }
-
-    // Get the channel's details
-    const channelPage = await notion.pages.retrieve({ page_id: channelId });
-    const channelName = channelPage.properties?.Name?.title?.[0]?.plain_text || '';
-
-    if (!channelName) {
-      return res.status(400).json({ error: 'Channel has no name' });
-    }
-
-    // Get channel's projects
-    const channelProjects = [];
-    const projectCandidates = ['🚀 projects', 'Projects', 'Project', '📁 Projects'];
-    for (const name of projectCandidates) {
-      const prop = channelPage.properties[name];
-      if (prop?.relation && prop.relation.length > 0) {
-        for (const r of prop.relation) channelProjects.push(r.id);
-        break;
-      }
-    }
-
-    if (channelProjects.length === 0) {
-      return res.status(200).json({ message: 'Channel has no projects, nothing to sync' });
-    }
-
-    // Find stories that already have sends, then check which share projects with this channel
-    // First, collect all unique story IDs from existing sends
-    const allStoryIds = new Set();
-    let cursor2;
-    do {
-      const response = await notion.databases.query({
-        database_id: PROMO_SENDS_DB_ID,
-        ...(cursor2 && { start_cursor: cursor2 })
-      });
-
-      for (const page of response.results) {
-        const storyRel = page.properties?.Story?.relation;
-        if (storyRel) {
-          for (const r of storyRel) allStoryIds.add(r.id);
-        }
-      }
-
-      cursor2 = response.has_more ? response.next_cursor : undefined;
-    } while (cursor2);
-
-    // Filter to stories whose projects overlap with this channel's projects
-    const matchingStoryIds = [];
-    for (const storyId of allStoryIds) {
-      const storyProjects = await getStoryProjects(storyId);
-      if (storyProjects.some(p => channelProjects.includes(p))) {
-        matchingStoryIds.push(storyId);
-      }
-    }
-
-    console.log(`📡 Found ${matchingStoryIds.length} active story/stories to sync channel "${channelName}" to`);
-
-    // Create sends for stories that don't already have this channel
-    let created = 0;
-    let skipped = 0;
-
-    for (const storyId of matchingStoryIds) {
-      const existingNames = await getExistingSends(storyId);
-      if (existingNames.has(channelName)) {
-        skipped++;
-        continue;
-      }
-
-      try {
-        await notion.pages.create({
-          parent: { database_id: PROMO_SENDS_DB_ID },
-          properties: {
-            Name: {
-              title: [{ text: { content: channelName } }]
-            },
-            Story: {
-              relation: [{ id: storyId }]
-            }
-          }
-        });
-        created++;
-      } catch (error) {
-        console.error(`❌ Failed to sync channel to story ${storyId}:`, error.message);
-      }
-    }
-
-    const summary = { channelName, storiesChecked: matchingStoryIds.length, created, skipped };
-    console.log('✅ Channel sync completed:', summary);
-    res.status(200).json({ message: 'Channel synced to stories', ...summary });
-
-  } catch (error) {
-    console.error('❌ Channel sync error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Channel sync failed', details: error.message });
-    }
-  }
-});
-
-// ─── Send Sync: Promo Sends DB → Channels DB ───────────────────────────────
-// When a send is added/edited in Promo Sends DB, push new channels back to Channels DB.
-// Only processes sends that have both a name AND a Story relation set,
-// so it won't fire prematurely while the user is still typing.
-
-app.post('/webhook/send-sync', async (req, res) => {
-  try {
-    console.log('🔄 Received send-sync webhook');
-
-    const sendId = req.body.sendId ||
-                   req.body.data?.id ||
-                   req.body.page?.id ||
-                   req.body.pageId ||
-                   req.body.id;
-
-    if (!sendId || typeof sendId !== 'string') {
-      return res.status(400).json({
-        error: 'Missing or invalid sendId',
-        receivedPayload: req.body
-      });
-    }
-
-    if (!PROMO_SENDS_DB_ID || !PROMO_CHANNELS_DB_ID) {
-      return res.status(500).json({
-        error: 'Server misconfigured: PROMO_SENDS_DB_ID and PROMO_CHANNELS_DB_ID must be set'
-      });
-    }
-
-    // Re-fetch the page to get current state (not stale webhook data)
-    const sendPage = await notion.pages.retrieve({ page_id: sendId });
-    const sendName = sendPage.properties?.Name?.title?.[0]?.plain_text || '';
-    const storyRel = sendPage.properties?.Story?.relation;
-
-    // Gate: only sync if the send has both a name and a linked story
-    if (!sendName) {
-      return res.status(200).json({ message: 'Send has no name yet, skipping' });
-    }
-    if (!storyRel || storyRel.length === 0) {
-      return res.status(200).json({ message: 'Send has no Story linked yet, skipping' });
-    }
-
-    // Check if this channel already exists in Channels DB
-    const existing = await notion.databases.query({
+  // Get all channel names from Channels DB
+  const channelNames = new Set();
+  let cursor;
+  do {
+    const response = await notion.databases.query({
       database_id: PROMO_CHANNELS_DB_ID,
-      filter: {
-        property: 'Name',
-        title: { equals: sendName }
-      }
+      ...(cursor && { start_cursor: cursor })
     });
 
-    if (existing.results.length > 0) {
-      return res.status(200).json({
-        message: 'Channel already exists in Channels DB',
-        channelName: sendName
-      });
+    for (const page of response.results) {
+      const name = page.properties?.Name?.title?.[0]?.plain_text || '';
+      if (name) channelNames.add(name);
     }
 
-    // Inherit projects from the linked story
-    const projectIds = await getStoryProjects(storyRel[0].id);
+    cursor = response.has_more ? response.next_cursor : undefined;
+  } while (cursor);
 
-    // Create the channel in Channels DB
-    const channelProperties = {
-      Name: {
-        title: [{ text: { content: sendName } }]
-      }
-    };
+  // Find sends that aren't in Channels DB
+  const projectIds = await getStoryProjects(storyId);
 
-    if (projectIds.length > 0) {
-      channelProperties['🚀 projects'] = {
-        relation: projectIds.map(id => ({ id }))
+  for (const sendName of existingSendNames) {
+    if (channelNames.has(sendName)) continue;
+    if (!sendName) continue;
+
+    try {
+      const channelProperties = {
+        Name: {
+          title: [{ text: { content: sendName } }]
+        }
       };
-    }
 
-    await notion.pages.create({
-      parent: { database_id: PROMO_CHANNELS_DB_ID },
-      properties: channelProperties
-    });
+      if (projectIds.length > 0) {
+        channelProperties['🚀 projects'] = {
+          relation: projectIds.map(id => ({ id }))
+        };
+      }
 
-    console.log(`✅ Created channel in Channels DB: ${sendName}`);
-    res.status(200).json({
-      message: 'New channel created in Channels DB',
-      channelName: sendName
-    });
+      await notion.pages.create({
+        parent: { database_id: PROMO_CHANNELS_DB_ID },
+        properties: channelProperties
+      });
 
-  } catch (error) {
-    console.error('❌ Send sync error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Send sync failed', details: error.message });
+      console.log(`✅ Pushed new channel to Channels DB: ${sendName}`);
+      created++;
+    } catch (error) {
+      console.error(`❌ Failed to push channel "${sendName}" to Channels DB:`, error.message);
     }
   }
-});
+
+  return { created };
+}
 
 // Test epic retrieval endpoint
 app.get('/test-epic/:epicId', async (req, res) => {
