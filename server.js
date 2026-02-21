@@ -17,9 +17,17 @@ const notion = new Client({
   auth: process.env.NOTION_API_TOKEN || process.env.NOTION_API_KEY,
 });
 
-// Database IDs
-const PRODUCT_WORKFLOWS_DB_ID = '263ce8f7317a804dad72cac4e8a5aa60';
-const STORIES_DB_ID = '1c1ce8f7317a80dfafc4d95c8cb67c3e';
+// Database IDs — Workflow Copy
+// NOTE: This workflow-copy feature was built for the Trass Notion workspace.
+// The original DB IDs are stale. Before reuse, set these env vars and review
+// property names in the target workspace (epic relations, date fields, etc.)
+const PRODUCT_WORKFLOWS_DB_ID = process.env.PRODUCT_WORKFLOWS_DB_ID;
+const STORIES_DB_ID = process.env.STORIES_DB_ID;
+
+// Database IDs — Promo Sends
+const PROMO_STORIES_DB_ID = process.env.PROMO_STORIES_DB_ID;
+const PROMO_CHANNELS_DB_ID = process.env.PROMO_CHANNELS_DB_ID;
+const PROMO_SENDS_DB_ID = process.env.PROMO_SENDS_DB_ID;
 
 // Store recent debug messages
 let debugMessages = [];
@@ -242,6 +250,223 @@ app.get('/debug', (req, res) => {
     recentMessages: debugMessages.slice(-10) // Show last 10 messages
   });
 });
+
+// ─── Promo Sends Endpoint ───────────────────────────────────────────────────
+
+app.post('/webhook/promo-sends', async (req, res) => {
+  try {
+    console.log('🚀 Received promo-sends webhook');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+
+    // Extract storyId — same flexible pattern as existing endpoint
+    const storyId = req.body.storyId ||
+                    req.body.data?.id ||
+                    req.body.page?.id ||
+                    req.body.pageId ||
+                    req.body.id;
+
+    if (!storyId || typeof storyId !== 'string') {
+      return res.status(400).json({
+        error: 'Missing or invalid storyId',
+        receivedPayload: req.body,
+        suggestion: 'Include storyId in the webhook payload'
+      });
+    }
+
+    if (!PROMO_CHANNELS_DB_ID || !PROMO_SENDS_DB_ID) {
+      return res.status(500).json({
+        error: 'Server misconfigured: PROMO_CHANNELS_DB_ID and PROMO_SENDS_DB_ID must be set'
+      });
+    }
+
+    // Step 1: Get the story's project IDs
+    const projectIds = await getStoryProjects(storyId);
+    console.log(`📁 Story has ${projectIds.length} project(s)`);
+
+    // Step 2: Find channels matching those projects
+    const channels = await getChannelsForProjects(projectIds);
+    console.log(`📡 Found ${channels.length} matching channel(s)`);
+
+    // Step 3: Check which sends already exist (skip duplicates)
+    const existingChannelIds = await getExistingPromoSends(storyId);
+    console.log(`📋 ${existingChannelIds.size} existing send(s) to skip`);
+
+    const newChannels = channels.filter(ch => !existingChannelIds.has(ch.id));
+    console.log(`🆕 ${newChannels.length} new send(s) to create`);
+
+    // Step 4: Bulk-create promo send pages
+    const createResults = await createPromoSends(storyId, newChannels);
+
+    // Step 5: Embed linked view in story page
+    const viewAdded = await embedPromoSendsView(storyId);
+
+    const summary = {
+      storyId,
+      channelsFound: channels.length,
+      sendsCreated: createResults.created,
+      sendsSkipped: existingChannelIds.size,
+      sendsFailed: createResults.failed,
+      linkedViewAdded: viewAdded
+    };
+
+    console.log('✅ Promo sends completed:', summary);
+    res.status(200).json({ message: 'Promo sends processed', ...summary });
+
+  } catch (error) {
+    console.error('❌ Promo sends error:', error);
+
+    if (error.code === 'unauthorized') {
+      return res.status(401).json({ error: 'Notion API token is invalid or expired' });
+    }
+    if (error.code === 'not_found') {
+      return res.status(404).json({ error: `Page or database not found: ${error.message}` });
+    }
+    if (error.code === 'validation_error') {
+      return res.status(400).json({ error: `Validation error: ${error.message}` });
+    }
+
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Promo sends failed', details: error.message });
+    }
+  }
+});
+
+// ─── Promo Sends Helpers ────────────────────────────────────────────────────
+
+// Fetch story page, return array of project page IDs from its Projects relation
+async function getStoryProjects(storyId) {
+  const page = await notion.pages.retrieve({ page_id: storyId });
+
+  const projectCandidates = ['Projects', 'Project', '📁 Projects', '📁 Project'];
+  for (const name of projectCandidates) {
+    const prop = page.properties[name];
+    if (prop?.relation && prop.relation.length > 0) {
+      return prop.relation.map(r => r.id);
+    }
+  }
+
+  console.log('⚠️ No Projects relation found. Available properties:', Object.keys(page.properties));
+  return [];
+}
+
+// Query Channels DB for channels whose Projects relation overlaps with given IDs
+async function getChannelsForProjects(projectIds) {
+  if (projectIds.length === 0) return [];
+
+  const seen = new Set();
+  const channels = [];
+
+  // Notion API doesn't support "relation contains any of [list]",
+  // so query per project and deduplicate
+  for (const projectId of projectIds) {
+    const response = await notion.databases.query({
+      database_id: PROMO_CHANNELS_DB_ID,
+      filter: {
+        property: 'Projects',
+        relation: { contains: projectId }
+      }
+    });
+
+    for (const page of response.results) {
+      if (!seen.has(page.id)) {
+        seen.add(page.id);
+        channels.push({ id: page.id, properties: page.properties });
+      }
+    }
+  }
+
+  return channels;
+}
+
+// Query Promo Sends DB for existing sends linked to this story, return set of channel IDs
+async function getExistingPromoSends(storyId) {
+  const existingChannelIds = new Set();
+
+  const response = await notion.databases.query({
+    database_id: PROMO_SENDS_DB_ID,
+    filter: {
+      property: 'Event',
+      relation: { contains: storyId }
+    }
+  });
+
+  for (const page of response.results) {
+    const channelProp = page.properties.Channel;
+    if (channelProp?.relation) {
+      for (const rel of channelProp.relation) {
+        existingChannelIds.add(rel.id);
+      }
+    }
+  }
+
+  return existingChannelIds;
+}
+
+// Create a Promo Send page for each channel, return { created, failed }
+async function createPromoSends(storyId, channels) {
+  let created = 0;
+  let failed = 0;
+
+  for (const channel of channels) {
+    try {
+      await notion.pages.create({
+        parent: { database_id: PROMO_SENDS_DB_ID },
+        properties: {
+          Event: { relation: [{ id: storyId }] },
+          Channel: { relation: [{ id: channel.id }] },
+          Sent: { checkbox: false }
+        }
+      });
+      created++;
+    } catch (error) {
+      console.error(`❌ Failed to create send for channel ${channel.id}:`, error.message);
+      failed++;
+    }
+  }
+
+  return { created, failed };
+}
+
+// Append a linked database view of Promo Sends (filtered to this story) in the story page.
+// Skips if a linked view to the Promo Sends DB already exists.
+async function embedPromoSendsView(storyId) {
+  // Check existing blocks for a linked database view pointing at PROMO_SENDS_DB_ID
+  const existingBlocks = await notion.blocks.children.list({
+    block_id: storyId,
+    page_size: 100
+  });
+
+  const alreadyHasView = existingBlocks.results.some(block =>
+    block.type === 'child_database' && block.child_database?.database_id === PROMO_SENDS_DB_ID
+  );
+
+  if (alreadyHasView) {
+    console.log('📎 Linked view already exists, skipping');
+    return false;
+  }
+
+  // Append a heading + linked database view
+  await notion.blocks.children.append({
+    block_id: storyId,
+    children: [
+      {
+        object: 'block',
+        type: 'heading_2',
+        heading_2: {
+          rich_text: [{ type: 'text', text: { content: 'Promo Sends' } }]
+        }
+      },
+      {
+        object: 'block',
+        type: 'link_to_page',
+        link_to_page: { type: 'database_id', database_id: PROMO_SENDS_DB_ID }
+      }
+    ]
+  });
+
+  console.log('📎 Linked database view added to story page');
+  return true;
+}
 
 // Test epic retrieval endpoint
 app.get('/test-epic/:epicId', async (req, res) => {

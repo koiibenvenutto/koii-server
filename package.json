@@ -1,7 +1,7 @@
 {
-  "name": "product-tools-render-server",
-  "version": "1.0.0",
-  "description": "Render server for handling Notion webhooks and copying workflows to stories",
+  "name": "koii-server",
+  "version": "2.0.0",
+  "description": "Notion automation server for workflow copying and promo sends",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
