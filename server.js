@@ -297,7 +297,7 @@ app.post('/webhook/promo-sends', async (req, res) => {
     console.log(`🆕 ${newChannels.length} new sub-task(s) to create`);
 
     // Step 4: Create sub-tasks in Stories DB
-    const createResults = await createPromoSubTasks(storyId, newChannels);
+    const createResults = await createPromoSubTasks(storyId, newChannels, projectIds);
 
     const summary = {
       storyId,
@@ -408,7 +408,7 @@ async function getExistingSubTaskChannels(storyId) {
 }
 
 // Create sub-tasks in Stories DB for each channel, return { created, failed }
-async function createPromoSubTasks(storyId, channels) {
+async function createPromoSubTasks(storyId, channels, parentProjectIds = []) {
   let created = 0;
   let failed = 0;
 
@@ -423,6 +423,9 @@ async function createPromoSubTasks(storyId, channels) {
           },
           'Parent task': {
             relation: [{ id: storyId }]
+          },
+          '🚀 projects': {
+            relation: parentProjectIds.map(id => ({ id }))
           }
         }
       });
