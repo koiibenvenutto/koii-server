@@ -272,9 +272,9 @@ app.post('/webhook/promo-sends', async (req, res) => {
       });
     }
 
-    if (!PROMO_CHANNELS_DB_ID || !PROMO_STORIES_DB_ID) {
+    if (!PROMO_CHANNELS_DB_ID) {
       return res.status(500).json({
-        error: 'Server misconfigured: PROMO_CHANNELS_DB_ID and PROMO_STORIES_DB_ID must be set'
+        error: 'Server misconfigured: PROMO_CHANNELS_DB_ID must be set'
       });
     }
 
@@ -286,29 +286,29 @@ app.post('/webhook/promo-sends', async (req, res) => {
     const channels = await getChannelsForProjects(projectIds);
     console.log(`📡 Found ${channels.length} matching channel(s)`);
 
-    // Step 3: Check existing sub-tasks to avoid duplicates
-    const existingChannelNames = await getExistingSubTaskChannels(storyId);
-    console.log(`📋 ${existingChannelNames.size} existing sub-task(s) to skip`);
+    // Step 3: Check existing checklist items to avoid duplicates
+    const existingChannelNames = await getExistingChecklistChannels(storyId);
+    console.log(`📋 ${existingChannelNames.size} existing checklist item(s) to skip`);
 
     const newChannels = channels.filter(ch => {
       const name = getChannelName(ch);
       return !existingChannelNames.has(name);
     });
-    console.log(`🆕 ${newChannels.length} new sub-task(s) to create`);
+    console.log(`🆕 ${newChannels.length} new checklist item(s) to add`);
 
-    // Step 4: Create sub-tasks in Stories DB
-    const createResults = await createPromoSubTasks(storyId, newChannels, projectIds);
+    // Step 4: Add checklist blocks to the story page (prepended at top)
+    const createResults = await addPromoChecklist(storyId, newChannels);
 
     const summary = {
       storyId,
       channelsFound: channels.length,
-      subTasksCreated: createResults.created,
-      subTasksSkipped: existingChannelNames.size,
-      subTasksFailed: createResults.failed
+      checklistItemsCreated: createResults.created,
+      checklistItemsSkipped: existingChannelNames.size,
+      checklistItemsFailed: createResults.failed
     };
 
     console.log('✅ Promo sends completed:', summary);
-    res.status(200).json({ message: 'Promo send sub-tasks created', ...summary });
+    res.status(200).json({ message: 'Promo checklist items added', ...summary });
 
   } catch (error) {
     console.error('❌ Promo sends error:', error);
@@ -381,63 +381,124 @@ function getChannelName(channel) {
   return channel.properties?.Name?.title?.[0]?.plain_text || 'Unnamed Channel';
 }
 
-// Check existing sub-tasks of a story, return set of names that look like promo sends
-async function getExistingSubTaskChannels(storyId) {
-  const page = await notion.pages.retrieve({ page_id: storyId });
-  const subTaskProp = page.properties['Sub-task'];
+// Check existing to_do blocks in story page, return set of channel names already in checklist
+async function getExistingChecklistChannels(storyId) {
   const existingNames = new Set();
+  let cursor;
 
-  if (!subTaskProp?.relation || subTaskProp.relation.length === 0) {
-    return existingNames;
-  }
+  do {
+    const response = await notion.blocks.children.list({
+      block_id: storyId,
+      page_size: 100,
+      ...(cursor && { start_cursor: cursor })
+    });
 
-  // Fetch each sub-task to check its name
-  for (const rel of subTaskProp.relation) {
-    try {
-      const subTask = await notion.pages.retrieve({ page_id: rel.id });
-      const name = subTask.properties?.Name?.title?.[0]?.plain_text || '';
-      if (name.startsWith('Send: ')) {
-        existingNames.add(name.replace('Send: ', ''));
+    for (const block of response.results) {
+      if (block.type === 'to_do') {
+        const text = block.to_do?.rich_text?.[0]?.plain_text || '';
+        if (text) existingNames.add(text);
       }
-    } catch (error) {
-      console.error(`⚠️ Could not fetch sub-task ${rel.id}:`, error.message);
     }
-  }
+
+    cursor = response.has_more ? response.next_cursor : undefined;
+  } while (cursor);
 
   return existingNames;
 }
 
-// Create sub-tasks in Stories DB for each channel, return { created, failed }
-async function createPromoSubTasks(storyId, channels, parentProjectIds = []) {
-  let created = 0;
-  let failed = 0;
+// Recursively collect a block and its children, cleaned for re-creation via the API
+async function collectBlockForRecreation(block) {
+  const { id, created_time, last_edited_time, created_by, last_edited_by,
+          parent, has_children, archived, in_trash, ...cleanBlock } = block;
 
-  for (const channel of channels) {
+  const unsupported = ['child_page', 'child_database', 'link_to_page', 'synced_block', 'template', 'unsupported'];
+  if (unsupported.includes(cleanBlock.type)) return null;
+
+  if (block.has_children) {
     try {
-      const channelName = getChannelName(channel);
-      await notion.pages.create({
-        parent: { database_id: PROMO_STORIES_DB_ID },
-        properties: {
-          Name: {
-            title: [{ text: { content: `Send: ${channelName}` } }]
-          },
-          'Parent task': {
-            relation: [{ id: storyId }]
-          },
-          '🚀 projects': {
-            relation: parentProjectIds.map(id => ({ id }))
-          }
-        }
+      const childResponse = await notion.blocks.children.list({
+        block_id: block.id,
+        page_size: 100
       });
-      console.log(`✅ Created sub-task: Send: ${channelName}`);
-      created++;
+
+      const children = [];
+      for (const child of childResponse.results) {
+        const collected = await collectBlockForRecreation(child);
+        if (collected) children.push(collected);
+      }
+
+      if (children.length > 0 && cleanBlock[cleanBlock.type]) {
+        cleanBlock[cleanBlock.type].children = children;
+      }
     } catch (error) {
-      console.error(`❌ Failed to create sub-task for channel ${channel.id}:`, error.message);
-      failed++;
+      console.error(`⚠️ Could not collect children for block ${block.id}:`, error.message);
     }
   }
 
-  return { created, failed };
+  return cleanBlock;
+}
+
+// Add to_do checklist blocks to the top of a story page
+async function addPromoChecklist(storyId, channels) {
+  if (channels.length === 0) return { created: 0, failed: 0 };
+
+  const checklistBlocks = channels.map(ch => ({
+    object: 'block',
+    type: 'to_do',
+    to_do: {
+      rich_text: [{ type: 'text', text: { content: getChannelName(ch) } }],
+      checked: false
+    }
+  }));
+
+  // Get existing page blocks
+  let existingBlocks = [];
+  let cursor;
+  do {
+    const response = await notion.blocks.children.list({
+      block_id: storyId,
+      page_size: 100,
+      ...(cursor && { start_cursor: cursor })
+    });
+    existingBlocks.push(...response.results);
+    cursor = response.has_more ? response.next_cursor : undefined;
+  } while (cursor);
+
+  if (existingBlocks.length === 0) {
+    // Page is empty — just append the checklist
+    await notion.blocks.children.append({
+      block_id: storyId,
+      children: checklistBlocks
+    });
+  } else {
+    // Collect existing blocks (with nested children) for reconstruction
+    const collectedBlocks = [];
+    for (const block of existingBlocks) {
+      const collected = await collectBlockForRecreation(block);
+      if (collected) collectedBlocks.push(collected);
+    }
+
+    // Delete existing top-level blocks
+    for (const block of existingBlocks) {
+      try {
+        await notion.blocks.delete({ block_id: block.id });
+      } catch (error) {
+        console.error(`⚠️ Could not delete block ${block.id}:`, error.message);
+      }
+    }
+
+    // Prepend: checklist first, then original content (batched at 100)
+    const allBlocks = [...checklistBlocks, ...collectedBlocks];
+    for (let i = 0; i < allBlocks.length; i += 100) {
+      await notion.blocks.children.append({
+        block_id: storyId,
+        children: allBlocks.slice(i, i + 100)
+      });
+    }
+  }
+
+  console.log(`✅ Added ${channels.length} checklist item(s) to story`);
+  return { created: channels.length, failed: 0 };
 }
 
 // Test epic retrieval endpoint
