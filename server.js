@@ -298,7 +298,7 @@ app.post('/webhook/promo-sends', async (req, res) => {
     console.log(`🆕 ${newChannels.length} new send(s) to create`);
 
     // Step 4: Create sends in Promo Sends DB
-    const createResults = await createPromoSends(storyId, newChannels, projectIds);
+    const createResults = await createPromoSends(storyId, newChannels);
 
     const summary = {
       storyId,
@@ -424,9 +424,6 @@ async function createPromoSends(storyId, channels, projectIds = []) {
           },
           Story: {
             relation: [{ id: storyId }]
-          },
-          '🚀 projects': {
-            relation: projectIds.map(id => ({ id }))
           }
         }
       });
@@ -491,45 +488,48 @@ app.post('/webhook/channel-sync', async (req, res) => {
       return res.status(200).json({ message: 'Channel has no projects, nothing to sync' });
     }
 
-    // Find stories that already have sends with matching projects
-    const storyIds = new Set();
-    for (const projectId of channelProjects) {
-      let cursor;
-      do {
-        const response = await notion.databases.query({
-          database_id: PROMO_SENDS_DB_ID,
-          filter: {
-            property: '🚀 projects',
-            relation: { contains: projectId }
-          },
-          ...(cursor && { start_cursor: cursor })
-        });
+    // Find stories that already have sends, then check which share projects with this channel
+    // First, collect all unique story IDs from existing sends
+    const allStoryIds = new Set();
+    let cursor2;
+    do {
+      const response = await notion.databases.query({
+        database_id: PROMO_SENDS_DB_ID,
+        ...(cursor2 && { start_cursor: cursor2 })
+      });
 
-        for (const page of response.results) {
-          const storyRel = page.properties?.Story?.relation;
-          if (storyRel) {
-            for (const r of storyRel) storyIds.add(r.id);
-          }
+      for (const page of response.results) {
+        const storyRel = page.properties?.Story?.relation;
+        if (storyRel) {
+          for (const r of storyRel) allStoryIds.add(r.id);
         }
+      }
 
-        cursor = response.has_more ? response.next_cursor : undefined;
-      } while (cursor);
+      cursor2 = response.has_more ? response.next_cursor : undefined;
+    } while (cursor2);
+
+    // Filter to stories whose projects overlap with this channel's projects
+    const matchingStoryIds = [];
+    for (const storyId of allStoryIds) {
+      const storyProjects = await getStoryProjects(storyId);
+      if (storyProjects.some(p => channelProjects.includes(p))) {
+        matchingStoryIds.push(storyId);
+      }
     }
 
-    console.log(`📡 Found ${storyIds.size} active story/stories to sync channel "${channelName}" to`);
+    console.log(`📡 Found ${matchingStoryIds.length} active story/stories to sync channel "${channelName}" to`);
 
     // Create sends for stories that don't already have this channel
     let created = 0;
     let skipped = 0;
 
-    for (const storyId of storyIds) {
+    for (const storyId of matchingStoryIds) {
       const existingNames = await getExistingSends(storyId);
       if (existingNames.has(channelName)) {
         skipped++;
         continue;
       }
 
-      const storyProjects = await getStoryProjects(storyId);
       try {
         await notion.pages.create({
           parent: { database_id: PROMO_SENDS_DB_ID },
@@ -539,9 +539,6 @@ app.post('/webhook/channel-sync', async (req, res) => {
             },
             Story: {
               relation: [{ id: storyId }]
-            },
-            '🚀 projects': {
-              relation: storyProjects.map(id => ({ id }))
             }
           }
         });
@@ -614,27 +611,31 @@ app.post('/webhook/send-sync', async (req, res) => {
       });
     }
 
-    // Get the send's projects
+    // Get the send's story to inherit its projects for the new channel
+    const storyRel = sendPage.properties?.Story?.relation;
     const projectIds = [];
-    const projectCandidates = ['🚀 projects', 'Projects', 'Project', '📁 Projects'];
-    for (const name of projectCandidates) {
-      const prop = sendPage.properties[name];
-      if (prop?.relation && prop.relation.length > 0) {
-        for (const r of prop.relation) projectIds.push(r.id);
-        break;
-      }
+    if (storyRel?.[0]?.id) {
+      const storyProjects = await getStoryProjects(storyRel[0].id);
+      for (const id of storyProjects) projectIds.push(id);
     }
 
     // Create the channel in Channels DB
+    const channelProperties = {
+      Name: {
+        title: [{ text: { content: sendName } }]
+      }
+    };
+
+    // Add projects if we found them from the story
+    if (projectIds.length > 0) {
+      channelProperties['🚀 projects'] = {
+        relation: projectIds.map(id => ({ id }))
+      };
+    }
+
     await notion.pages.create({
       parent: { database_id: PROMO_CHANNELS_DB_ID },
-      properties: {
-        Name: {
-          title: [{ text: { content: sendName } }]
-        },
-        '🚀 projects': {
-          relation: projectIds.map(id => ({ id }))
-        }
+      properties: channelProperties
       }
     });
 
