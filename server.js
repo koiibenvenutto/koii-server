@@ -337,7 +337,7 @@ app.post('/webhook/promo-sends', async (req, res) => {
 async function getStoryProjects(storyId) {
   const page = await notion.pages.retrieve({ page_id: storyId });
 
-  const projectCandidates = ['Projects', 'Project', '📁 Projects', '📁 Project'];
+  const projectCandidates = ['🚀 projects', 'Projects', 'Project', '📁 Projects', '📁 Project'];
   for (const name of projectCandidates) {
     const prop = page.properties[name];
     if (prop?.relation && prop.relation.length > 0) {
@@ -362,7 +362,7 @@ async function getChannelsForProjects(projectIds) {
     const response = await notion.databases.query({
       database_id: PROMO_CHANNELS_DB_ID,
       filter: {
-        property: 'Projects',
+        property: '🚀 projects',
         relation: { contains: projectId }
       }
     });
@@ -427,45 +427,63 @@ async function createPromoSends(storyId, channels) {
   return { created, failed };
 }
 
-// Append a linked database view of Promo Sends (filtered to this story) in the story page.
-// Skips if a linked view to the Promo Sends DB already exists.
+// Append a link to the Promo Sends DB in the story page.
+// Skips if a "Promo Sends" heading already exists (to avoid duplicates on re-trigger).
 async function embedPromoSendsView(storyId) {
-  // Check existing blocks for a linked database view pointing at PROMO_SENDS_DB_ID
-  const existingBlocks = await notion.blocks.children.list({
-    block_id: storyId,
-    page_size: 100
-  });
+  try {
+    // Check existing blocks for a "Promo Sends" heading (duplicate guard)
+    const existingBlocks = await notion.blocks.children.list({
+      block_id: storyId,
+      page_size: 100
+    });
 
-  const alreadyHasView = existingBlocks.results.some(block =>
-    block.type === 'child_database' && block.child_database?.database_id === PROMO_SENDS_DB_ID
-  );
+    const alreadyHasView = existingBlocks.results.some(block => {
+      if (block.type === 'heading_2') {
+        const text = block.heading_2?.rich_text?.[0]?.plain_text || '';
+        return text.toLowerCase().includes('promo sends');
+      }
+      return false;
+    });
 
-  if (alreadyHasView) {
-    console.log('📎 Linked view already exists, skipping');
+    if (alreadyHasView) {
+      console.log('📎 Promo Sends section already exists, skipping');
+      return false;
+    }
+
+    // Append a heading + link to the Promo Sends DB
+    const promoSendsUrl = `https://www.notion.so/${PROMO_SENDS_DB_ID.replace(/-/g, '')}`;
+    await notion.blocks.children.append({
+      block_id: storyId,
+      children: [
+        {
+          object: 'block',
+          type: 'heading_2',
+          heading_2: {
+            rich_text: [{ type: 'text', text: { content: 'Promo Sends' } }]
+          }
+        },
+        {
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{
+              type: 'text',
+              text: {
+                content: 'View Promo Sends',
+                link: { url: promoSendsUrl }
+              }
+            }]
+          }
+        }
+      ]
+    });
+
+    console.log('📎 Promo Sends link added to story page');
+    return true;
+  } catch (error) {
+    console.error('⚠️ Failed to embed promo sends view (non-fatal):', error.message);
     return false;
   }
-
-  // Append a heading + linked database view
-  await notion.blocks.children.append({
-    block_id: storyId,
-    children: [
-      {
-        object: 'block',
-        type: 'heading_2',
-        heading_2: {
-          rich_text: [{ type: 'text', text: { content: 'Promo Sends' } }]
-        }
-      },
-      {
-        object: 'block',
-        type: 'link_to_page',
-        link_to_page: { type: 'database_id', database_id: PROMO_SENDS_DB_ID }
-      }
-    ]
-  });
-
-  console.log('📎 Linked database view added to story page');
-  return true;
 }
 
 // Test epic retrieval endpoint
