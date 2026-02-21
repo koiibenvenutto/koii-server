@@ -636,7 +636,6 @@ app.post('/webhook/send-sync', async (req, res) => {
     await notion.pages.create({
       parent: { database_id: PROMO_CHANNELS_DB_ID },
       properties: channelProperties
-      }
     });
 
     console.log(`✅ Created channel in Channels DB: ${sendName}`);
