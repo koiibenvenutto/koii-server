@@ -301,7 +301,7 @@ app.post('/webhook/promo-sends', async (req, res) => {
     });
     console.log(`🆕 ${newChannels.length} new send(s) to create`);
 
-    const forwardResults = await createPromoSends(storyId, newChannels);
+    const forwardResults = await createPromoSends(storyId, newChannels, projectIds);
 
     const summary = {
       storyId,
@@ -420,16 +420,24 @@ async function createPromoSends(storyId, channels, projectIds = []) {
   for (const channel of channels) {
     try {
       const channelName = getChannelName(channel);
+      const sendProperties = {
+        Name: {
+          title: [{ text: { content: channelName } }]
+        },
+        Story: {
+          relation: [{ id: storyId }]
+        }
+      };
+
+      if (projectIds.length > 0) {
+        sendProperties['🚀 projects'] = {
+          relation: projectIds.map(id => ({ id }))
+        };
+      }
+
       await notion.pages.create({
         parent: { database_id: PROMO_SENDS_DB_ID },
-        properties: {
-          Name: {
-            title: [{ text: { content: channelName } }]
-          },
-          Story: {
-            relation: [{ id: storyId }]
-          }
-        }
+        properties: sendProperties
       });
       console.log(`✅ Created send: ${channelName}`);
       created++;
