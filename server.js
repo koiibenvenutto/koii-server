@@ -336,12 +336,27 @@ app.post('/webhook/promo-sends', async (req, res) => {
 
 // ─── Promo Sends Helpers ────────────────────────────────────────────────────
 
+const PROJECT_PROPERTY_CANDIDATES = ['🚀 projects', 'Projects', 'Project', '📁 Projects', '📁 Project'];
+
+// Discover the actual projects relation property name for a Notion database
+async function getProjectsPropertyName(databaseId) {
+  const db = await notion.databases.retrieve({ database_id: databaseId });
+  for (const candidate of PROJECT_PROPERTY_CANDIDATES) {
+    if (db.properties[candidate]?.type === 'relation') {
+      console.log(`📎 Found projects property "${candidate}" on DB ${databaseId}`);
+      return candidate;
+    }
+  }
+  console.log(`⚠️ No projects relation found on DB ${databaseId}. Available properties:`,
+    Object.entries(db.properties).map(([k, v]) => `${k} (${v.type})`));
+  return null;
+}
+
 // Fetch story page, return array of project page IDs from its Projects relation
 async function getStoryProjects(storyId) {
   const page = await notion.pages.retrieve({ page_id: storyId });
 
-  const projectCandidates = ['🚀 projects', 'Projects', 'Project', '📁 Projects', '📁 Project'];
-  for (const name of projectCandidates) {
+  for (const name of PROJECT_PROPERTY_CANDIDATES) {
     const prop = page.properties[name];
     if (prop?.relation && prop.relation.length > 0) {
       return prop.relation.map(r => r.id);
@@ -356,6 +371,9 @@ async function getStoryProjects(storyId) {
 async function getChannelsForProjects(projectIds) {
   if (projectIds.length === 0) return [];
 
+  const channelsProjectsProp = await getProjectsPropertyName(PROMO_CHANNELS_DB_ID);
+  if (!channelsProjectsProp) return [];
+
   const seen = new Set();
   const channels = [];
 
@@ -365,7 +383,7 @@ async function getChannelsForProjects(projectIds) {
     const response = await notion.databases.query({
       database_id: PROMO_CHANNELS_DB_ID,
       filter: {
-        property: '🚀 projects',
+        property: channelsProjectsProp,
         relation: { contains: projectId }
       }
     });
@@ -417,6 +435,12 @@ async function createPromoSends(storyId, channels, projectIds = []) {
   let created = 0;
   let failed = 0;
 
+  // Discover the projects property name once for the Sends DB
+  let sendsProjectsProp = null;
+  if (projectIds.length > 0) {
+    sendsProjectsProp = await getProjectsPropertyName(PROMO_SENDS_DB_ID);
+  }
+
   for (const channel of channels) {
     try {
       const channelName = getChannelName(channel);
@@ -429,8 +453,8 @@ async function createPromoSends(storyId, channels, projectIds = []) {
         }
       };
 
-      if (projectIds.length > 0) {
-        sendProperties['🚀 projects'] = {
+      if (sendsProjectsProp && projectIds.length > 0) {
+        sendProperties[sendsProjectsProp] = {
           relation: projectIds.map(id => ({ id }))
         };
       }
@@ -478,6 +502,12 @@ async function syncSendsToChannels(storyId) {
   // Find sends that aren't in Channels DB
   const projectIds = await getStoryProjects(storyId);
 
+  // Discover the projects property name once for the Channels DB
+  let channelsProjectsProp = null;
+  if (projectIds.length > 0) {
+    channelsProjectsProp = await getProjectsPropertyName(PROMO_CHANNELS_DB_ID);
+  }
+
   for (const sendName of existingSendNames) {
     if (channelNames.has(sendName)) continue;
     if (!sendName) continue;
@@ -489,8 +519,8 @@ async function syncSendsToChannels(storyId) {
         }
       };
 
-      if (projectIds.length > 0) {
-        channelProperties['🚀 projects'] = {
+      if (channelsProjectsProp && projectIds.length > 0) {
+        channelProperties[channelsProjectsProp] = {
           relation: projectIds.map(id => ({ id }))
         };
       }
